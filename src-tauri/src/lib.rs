@@ -7,8 +7,11 @@ use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{CallNextHookEx, KBDLLHOOKSTRUCT, SetWindowsHookExW};
 
 struct TrayHandle(#[allow(dead_code)] tauri::tray::TrayIcon<tauri::Wry>);
@@ -17,6 +20,7 @@ struct SearchState(Arc<Mutex<HashMap<String, SearchCursor>>>);
 static NEXT_CURSOR: AtomicU64 = AtomicU64::new(1);
 static INPUT_LOCKED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_os = "windows")]
 unsafe extern "system" fn input_lock_hook(code: i32, message: usize, data: isize) -> isize {
   if code == 0 && INPUT_LOCKED.load(Ordering::Relaxed) {
     let key = (*(data as *const KBDLLHOOKSTRUCT)).vkCode;
@@ -25,11 +29,15 @@ unsafe extern "system" fn input_lock_hook(code: i32, message: usize, data: isize
   CallNextHookEx(std::ptr::null_mut(), code, message, data)
 }
 
+#[cfg(target_os = "windows")]
 fn install_input_lock_hook() -> Result<(), String> {
   let hook = unsafe { SetWindowsHookExW(13, Some(input_lock_hook), GetModuleHandleW(std::ptr::null()), 0) };
   if hook.is_null() { return Err("Could not install the Windows-key input lock".into()); }
   Ok(())
 }
+
+#[cfg(not(target_os = "windows"))]
+fn install_input_lock_hook() -> Result<(), String> { Ok(()) }
 
 #[derive(Serialize)]
 struct SearchResult { id: String, title: String, channel: String, channel_id: String, duration: String, thumbnail: String }
