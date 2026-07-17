@@ -81,11 +81,11 @@ jobs:
           )
           foreach ($pattern in $patterns) {
             Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | ForEach-Object {
-              Copy-Item -LiteralPath $_.FullName -Destination "$out/$env:ARTIFACT-$($_.Name)" -Force
+              Copy-Item -LiteralPath $_.FullName -Destination "$out/$($_.Name)" -Force
             }
           }
           Get-ChildItem -Path "src-tauri/target/release/bundle/macos/*.app" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-            Compress-Archive -Path $_.FullName -DestinationPath "$out/$env:ARTIFACT-$($_.Name).zip" -Force
+            Compress-Archive -Path $_.FullName -DestinationPath "$out/Tauritube_$($env:ARTIFACT -replace '^tauritube-', '').app.zip" -Force
           }
 
       - name: Upload app
