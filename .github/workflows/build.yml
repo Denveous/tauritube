@@ -155,5 +155,6 @@ jobs:
           body: Automated build from `${{ github.sha }}`.
           artifacts: release-artifacts/*
           allowUpdates: true
+          removeArtifacts: true
           replacesArtifacts: true
           makeLatest: true
