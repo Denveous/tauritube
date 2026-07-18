@@ -5,5 +5,6 @@
   "identifier": "land.moreno.tauritube",
   "build": { "beforeBuildCommand": "npm run frontend:build", "beforeDevCommand": "npm run dev", "frontendDist": "../dist", "devUrl": "http://localhost:1420" },
   "app": { "windows": [], "security": { "csp": null } },
-  "bundle": { "active": true, "targets": "all", "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"] }
+  "plugins": { "updater": { "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDFBQUVCNjc1MjkxRDU0QjgKUldTNFZCMHBkYmF1R2hqTytIMDZ6L3BvVndSNjdmU096NUp2UjZiNHAybTJiRkhLRUFnVFRhOEQK", "endpoints": ["https://github.com/Denveous/tauritube/releases/latest/download/latest.json"] } },
+  "bundle": { "active": true, "targets": "all", "createUpdaterArtifacts": true, "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"] }
 }

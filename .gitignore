@@ -7,3 +7,4 @@ release/
 *.exe
 *.dmp
 *.bak
+src-tauri/tauritube-updater.key

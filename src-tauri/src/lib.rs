@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 #[cfg(target_os = "windows")]
@@ -44,9 +44,9 @@ struct SearchResult { id: String, title: String, channel: String, channel_id: St
 #[derive(Serialize)]
 struct SearchPage { results: Vec<SearchResult>, cursor: Option<String> }
 #[derive(Clone, Deserialize, Serialize)]
-struct Subscription { channel: String, #[serde(default)] channel_id: String }
+struct Subscription { channel: String, #[serde(default)] channel_id: String, #[serde(default)] avatar: String }
 #[derive(Clone, Deserialize, Serialize)]
-struct BlockedItem { kind: String, value: String, #[serde(default)] label: String }
+struct BlockedItem { kind: String, value: String, #[serde(default)] label: String, #[serde(default)] thumbnail: String }
 
 fn subscriptions_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
   let directory = app.path().app_data_dir().map_err(|error| error.to_string())?;
@@ -80,11 +80,12 @@ fn dedupe_blocks(blocks: &mut Vec<BlockedItem>) {
   blocks.retain(|item| seen.insert(format!("{}:{}", item.kind, if item.kind == "channel" && !item.label.is_empty() { item.label.to_lowercase() } else { item.value.to_lowercase() })));
 }
 
-fn add_block(kind: String, value: String, label: String, app: tauri::AppHandle) -> Result<(), String> {
+fn add_block(kind: String, value: String, label: String, thumbnail: String, app: tauri::AppHandle) -> Result<(), String> {
   if value.is_empty() { return Ok(()); }
   let mut blocks = read_blocks(&app)?;
   dedupe_blocks(&mut blocks);
-  if !blocks.iter().any(|item| item.kind == kind && (item.value.eq_ignore_ascii_case(&value) || kind == "channel" && !label.is_empty() && item.label.eq_ignore_ascii_case(&label))) { blocks.push(BlockedItem { kind, value, label }); }
+  if let Some(item) = blocks.iter_mut().find(|item| item.kind == kind && (item.value.eq_ignore_ascii_case(&value) || kind == "channel" && !label.is_empty() && item.label.eq_ignore_ascii_case(&label))) { if item.label.is_empty() { item.label = label; } if item.thumbnail.is_empty() { item.thumbnail = thumbnail; } }
+  else { blocks.push(BlockedItem { kind, value, label, thumbnail }); }
   fs::write(blocks_path(&app)?, serde_json::to_string_pretty(&blocks).map_err(|error| error.to_string())?).map_err(|error| error.to_string())
 }
 
@@ -95,10 +96,10 @@ fn list_subscriptions(app: tauri::AppHandle) -> Result<Vec<Subscription>, String
 fn list_blocks(app: tauri::AppHandle) -> Result<Vec<BlockedItem>, String> { let mut blocks = read_blocks(&app)?; dedupe_blocks(&mut blocks); fs::write(blocks_path(&app)?, serde_json::to_string_pretty(&blocks).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?; Ok(blocks) }
 
 #[tauri::command]
-fn block_video(id: String, app: tauri::AppHandle) -> Result<(), String> { add_block("video".into(), id.clone(), id, app) }
+fn block_video(id: String, label: Option<String>, thumbnail: Option<String>, app: tauri::AppHandle) -> Result<(), String> { let fallback_thumbnail = format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"); add_block("video".into(), id.clone(), label.filter(|value| !value.is_empty()).unwrap_or_else(|| id.clone()), thumbnail.filter(|value| !value.is_empty()).unwrap_or(fallback_thumbnail), app) }
 
 #[tauri::command]
-fn block_channel(channel: String, channel_id: String, app: tauri::AppHandle) -> Result<(), String> { let value = if channel_id.is_empty() { channel.clone() } else { channel_id }; add_block("channel".into(), value, channel, app) }
+fn block_channel(channel: String, channel_id: String, thumbnail: Option<String>, app: tauri::AppHandle) -> Result<(), String> { let value = if channel_id.is_empty() { channel.clone() } else { channel_id }; add_block("channel".into(), value, channel, thumbnail.unwrap_or_default(), app) }
 
 #[tauri::command]
 fn unblock_item(kind: String, value: String, app: tauri::AppHandle) -> Result<(), String> {
@@ -108,10 +109,10 @@ fn unblock_item(kind: String, value: String, app: tauri::AppHandle) -> Result<()
 }
 
 #[tauri::command]
-fn subscribe_channel(channel: String, channel_id: String, app: tauri::AppHandle) -> Result<(), String> {
+fn subscribe_channel(channel: String, channel_id: String, avatar: Option<String>, app: tauri::AppHandle) -> Result<(), String> {
   let mut subscriptions = read_subscriptions(&app)?;
-  if let Some(item) = subscriptions.iter_mut().find(|item| item.channel.eq_ignore_ascii_case(&channel)) { if !channel_id.is_empty() { item.channel_id = channel_id; } }
-  else if !channel.is_empty() { subscriptions.push(Subscription { channel, channel_id }); }
+  if let Some(item) = subscriptions.iter_mut().find(|item| item.channel.eq_ignore_ascii_case(&channel)) { if !channel_id.is_empty() { item.channel_id = channel_id; } if item.avatar.is_empty() { item.avatar = avatar.unwrap_or_default(); } }
+  else if !channel.is_empty() { subscriptions.push(Subscription { channel, channel_id, avatar: avatar.unwrap_or_default() }); }
   let path = subscriptions_path(&app)?;
   fs::write(path, serde_json::to_string_pretty(&subscriptions).map_err(|error| error.to_string())?).map_err(|error| error.to_string())
 }
@@ -283,11 +284,13 @@ fn shorts_sync() -> Result<SearchPage, String> {
   let mut seen = HashSet::new();
   if let Some(data) = initial_data(&page) { collect_results(&data, &mut results, &mut seen); }
   collect_reel_results(&page, &mut results, &mut seen);
-  let seeds = results.iter().map(|result| result.id.clone()).collect::<Vec<_>>();
-  for id in seeds.into_iter().take(3) {
-    if results.len() >= 30 { break; }
-    if let Ok(page) = client.get(format!("https://www.youtube.com/shorts/{id}")).query(&[("hl", "en"), ("gl", "US")]).send().and_then(|response| response.error_for_status()).and_then(|response| response.text()) { collect_reel_results(&page, &mut results, &mut seen); }
-  }
+  Ok(SearchPage { results, cursor: None })
+}
+
+fn shorts_more_sync(video_id: String) -> Result<SearchPage, String> {
+  let page = reqwest::blocking::Client::builder().user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36").build().map_err(|e| e.to_string())?.get(format!("https://www.youtube.com/shorts/{video_id}")).query(&[("hl", "en"), ("gl", "US")]).send().map_err(|e| format!("YouTube Shorts request failed: {e}"))?.error_for_status().map_err(|e| format!("YouTube Shorts failed: {e}"))?.text().map_err(|e| e.to_string())?;
+  let mut results = Vec::new();
+  collect_reel_results(&page, &mut results, &mut HashSet::new());
   Ok(SearchPage { results, cursor: None })
 }
 
@@ -310,6 +313,13 @@ fn channel_id_sync(channel: &str) -> Result<String, String> {
   let mut results = Vec::new();
   collect_results(&data, &mut results, &mut HashSet::new());
   results.iter().find(|result| result.channel.eq_ignore_ascii_case(channel) && !result.channel_id.is_empty()).or_else(|| results.iter().find(|result| !result.channel_id.is_empty())).map(|result| result.channel_id.clone()).ok_or_else(|| "Could not find that channel's YouTube ID".to_owned())
+}
+
+fn channel_avatar_sync(channel_id: String) -> Result<String, String> {
+  let page = reqwest::blocking::Client::builder().user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36").build().map_err(|e| e.to_string())?.get(format!("https://www.youtube.com/channel/{channel_id}")).query(&[("hl", "en"), ("gl", "US")]).send().map_err(|e| format!("YouTube channel request failed: {e}"))?.error_for_status().map_err(|e| format!("YouTube channel request failed: {e}"))?.text().map_err(|e| e.to_string())?;
+  let from_meta = page.find("property=\"og:image\"").and_then(|index| page[index..].find("content=\"").map(|offset| &page[index + offset + 9..])).and_then(|value| value.find('"').map(|end| value[..end].to_owned()));
+  let from_image = ["https://yt3.ggpht.com/", "https://yt3.googleusercontent.com/"].iter().find_map(|marker| page.find(marker).and_then(|index| { let value = &page[index..]; value.find('"').map(|end| value[..end].to_owned()) }));
+  from_meta.or(from_image).map(|value| value.replace("\\u0026", "&")).ok_or("YouTube did not return a channel avatar".into())
 }
 
 #[tauri::command]
@@ -335,6 +345,11 @@ async fn load_shorts(app: tauri::AppHandle) -> Result<SearchPage, String> {
 }
 
 #[tauri::command]
+async fn load_shorts_more(video_id: String) -> Result<SearchPage, String> {
+  tauri::async_runtime::spawn_blocking(move || shorts_more_sync(video_id)).await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 async fn load_home(app: tauri::AppHandle) -> Result<SearchPage, String> {
   let subscriptions = read_subscriptions(&app)?;
   let (page, subscriptions) = tauri::async_runtime::spawn_blocking(move || subscription_videos_sync(subscriptions)).await.map_err(|error| error.to_string())??;
@@ -353,6 +368,18 @@ async fn load_channel_videos(channel: String, channel_id: String, app: tauri::Ap
   if let Some(item) = subscriptions.iter_mut().find(|item| item.channel.eq_ignore_ascii_case(&resolved_channel)) { item.channel_id = resolved_id; }
   fs::write(subscriptions_path(&app)?, serde_json::to_string_pretty(&subscriptions).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
   Ok(page)
+}
+
+#[tauri::command]
+async fn load_subscription_avatar(channel: String, channel_id: String, app: tauri::AppHandle) -> Result<String, String> {
+  let lookup_channel = channel.clone();
+  let resolved_id = tauri::async_runtime::spawn_blocking(move || if channel_id.is_empty() { channel_id_sync(&lookup_channel) } else { Ok(channel_id) }).await.map_err(|error| error.to_string())??;
+  let avatar_id = resolved_id.clone();
+  let avatar = tauri::async_runtime::spawn_blocking(move || channel_avatar_sync(avatar_id)).await.map_err(|error| error.to_string())??;
+  let mut subscriptions = read_subscriptions(&app)?;
+  if let Some(item) = subscriptions.iter_mut().find(|item| item.channel.eq_ignore_ascii_case(&channel)) { item.channel_id = resolved_id; item.avatar = avatar.clone(); }
+  fs::write(subscriptions_path(&app)?, serde_json::to_string_pretty(&subscriptions).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+  Ok(avatar)
 }
 
 #[tauri::command]
@@ -385,7 +412,7 @@ const PLAYER_GUARD: &str = r#"(function () {
   const addBack = () => { if (!new URLSearchParams(location.search).has('tauritube_shorts')) return; const host = document.querySelector('player-top-controls.ytwPlayerTopControlsHost, .ytwPlayerTopControlsHost'); const right = host && host.querySelector('.ytwPlayerTopControlsPlayerControlsTopRight, .player-controls-top-right'); if (!right || right.dataset.ytTauriBack) return; right.dataset.ytTauriBack = '1'; let style = document.getElementById('yt-tauri-back-style'); if (!style) { style = document.createElement('style'); style.id = 'yt-tauri-back-style'; style.textContent = '.ytwPlayerTopControlsPlayerControlsTopRight[data-yt-tauri-back]::before,.player-controls-top-right[data-yt-tauri-back]::before{content:"‹";width:38px;height:38px;display:flex;align-items:center;justify-content:center;background:transparent;color:#fff;font:bold 38px/1 Arial,sans-serif;cursor:pointer;flex:0 0 38px;margin-right:8px}'; document.head.append(style); } right.addEventListener('click', event => { const rect = right.getBoundingClientRect(); if (event.clientX > rect.left + 46) return; event.preventDefault(); event.stopImmediatePropagation(); parent.postMessage({ source: 'youtube-tauri', action: 'back' }, '*'); }, true); };
   const addMobileBack = () => { const host = document.querySelector('.ytmVideoInfoVideoDetailsContainer'); if (!host || document.getElementById('yt-tauri-mobile-back')) return; document.documentElement.classList.add('yt-tauri-mobile-info'); const button = document.createElement('button'); button.id = 'yt-tauri-mobile-back'; button.type = 'button'; button.ariaLabel = 'Back to Tauritube'; button.textContent = '‹'; const place = () => { const rect = host.getBoundingClientRect(); button.style.left = `${Math.max(8, rect.left - 42)}px`; button.style.top = `${rect.top + 7}px`; }; button.addEventListener('pointerdown', event => { event.preventDefault(); event.stopImmediatePropagation(); parent.postMessage({ source: 'youtube-tauri', action: 'back' }, '*'); }, true); button.addEventListener('click', event => { event.preventDefault(); event.stopImmediatePropagation(); }, true); let style = document.getElementById('yt-tauri-mobile-back-style'); if (!style) { style = document.createElement('style'); style.id = 'yt-tauri-mobile-back-style'; style.textContent = '.ytmVideoInfoVideoDetailsContainer{transform:translateX(46px)!important}html.yt-tauri-mobile-info .ytwPlayerTopControlsPlayerControlsTopRight[data-yt-tauri-back]::before,html.yt-tauri-mobile-info .player-controls-top-right[data-yt-tauri-back]::before{display:none!important}#yt-tauri-mobile-back{position:fixed!important;z-index:2147483647!important;display:grid!important;place-items:center!important;width:38px!important;height:38px!important;margin:0!important;padding:0!important;border:0!important;background:transparent!important;color:#fff!important;font:38px/1 Arial,sans-serif!important;cursor:pointer!important;pointer-events:auto!important;transition:opacity .15s ease!important}html.yt-tauri-controls-hidden #yt-tauri-mobile-back{opacity:0!important;visibility:hidden!important;pointer-events:none!important}'; document.head.append(style); } host.parentElement?.append(button); requestAnimationFrame(place); addEventListener('resize', place, { passive: true }); };
   const addBlock = () => { const host = document.querySelector('player-top-controls.ytwPlayerTopControlsHost, .ytwPlayerTopControlsHost'); const right = host && host.querySelector('.ytwPlayerTopControlsPlayerControlsTopRight, .player-controls-top-right'); if (!right || document.getElementById('yt-tauri-block')) return; const button = document.createElement('button'); button.id = 'yt-tauri-block'; button.type = 'button'; button.ariaLabel = 'Block'; button.textContent = '⊘'; const menu = document.createElement('div'); menu.id = 'yt-tauri-block-menu'; const info = () => { const channel = document.querySelector('.ytmVideoInfoChannelTitle'); const href = channel?.getAttribute('href') || ''; return { videoId: new URL(location.href).searchParams.get('v') || location.pathname.match(/\/(?:embed|shorts)\/([^/?]+)/)?.[1] || '', channel: channel?.textContent?.trim() || '', channelId: href.match(/\/channel\/([^/?]+)/)?.[1] || '' }; }; const add = (label, action) => { const item = document.createElement('button'); item.textContent = label; item.addEventListener('click', event => { event.preventDefault(); event.stopImmediatePropagation(); parent.postMessage({ source: 'tauritube', action, ...info() }, '*'); }); menu.append(item); }; add('Block video', 'block-video'); add('Block channel', 'block-channel'); button.addEventListener('click', event => { event.preventDefault(); event.stopImmediatePropagation(); menu.classList.toggle('open'); }); let style = document.getElementById('yt-tauri-block-style'); if (!style) { style = document.createElement('style'); style.id = 'yt-tauri-block-style'; style.textContent = '.ytwPlayerTopControlsPlayerControlsTopRight,.player-controls-top-right{position:relative!important}#yt-tauri-block{width:38px;height:38px;display:grid;place-items:center;transform:translateY(4px);background:transparent;border:0;color:#fff;font:24px/1 Arial,sans-serif;cursor:pointer}#yt-tauri-block-menu{display:none;position:absolute;top:42px;right:0;z-index:2147483647;padding:5px;border-radius:6px;background:#171717;box-shadow:0 8px 22px rgba(0,0,0,.55)}#yt-tauri-block-menu.open{display:grid;gap:4px}#yt-tauri-block-menu button{padding:7px 9px;border:0;border-radius:4px;background:#2b2b2b;color:#fff;white-space:nowrap;font:12px system-ui;cursor:pointer}#yt-tauri-block-menu button:hover{background:#832222}'; document.head.append(style); } right.prepend(button, menu); };
-  const addMini = () => { const right = document.querySelector('player-bottom-controls .player-controls-bottom-right'); if (!right || right.dataset.ytTauriMini) return; right.dataset.ytTauriMini = '1'; const popout = document.createElement('button'); popout.id = 'yt-tauri-popout'; popout.type = 'button'; popout.ariaLabel = 'Picture in picture'; popout.textContent = '↗'; popout.addEventListener('click', event => { event.preventDefault(); event.stopImmediatePropagation(); document.querySelector('video')?.requestPictureInPicture?.().catch(() => {}); }, true); right.prepend(popout); let style = document.getElementById('yt-tauri-mini-style'); if (!style) { style = document.createElement('style'); style.id = 'yt-tauri-mini-style'; style.textContent = '.player-controls-bottom-right[data-yt-tauri-mini]{display:flex;align-items:center}.player-controls-bottom-right[data-yt-tauri-mini]::before,#yt-tauri-popout{width:38px;height:38px;display:flex;align-items:center;justify-content:center;color:#fff;font:25px/1 Arial,sans-serif;cursor:pointer;flex:0 0 38px;background:transparent;border:0} .player-controls-bottom-right[data-yt-tauri-mini]::before{content:"◲"}'; document.head.append(style); } right.addEventListener('click', event => { const rect = right.getBoundingClientRect(); if (event.clientX > rect.left + 42) return; event.preventDefault(); event.stopImmediatePropagation(); parent.postMessage({ source: 'youtube-tauri', action: 'mini' }, '*'); }, true); };
+  const addMini = () => { const right = document.querySelector('player-bottom-controls .player-controls-bottom-right'); if (!right || right.dataset.ytTauriMini) return; right.dataset.ytTauriMini = '1'; const popout = document.createElement('button'); popout.id = 'yt-tauri-popout'; popout.type = 'button'; popout.ariaLabel = 'Picture in picture'; popout.textContent = '↗'; popout.addEventListener('click', event => { event.preventDefault(); event.stopImmediatePropagation(); document.querySelector('video')?.requestPictureInPicture?.().catch(() => {}); }, true); right.prepend(popout); let style = document.getElementById('yt-tauri-mini-style'); if (!style) { style = document.createElement('style'); style.id = 'yt-tauri-mini-style'; style.textContent = '.player-controls-bottom-right[data-yt-tauri-mini]{display:flex;align-items:center}.player-controls-bottom-right[data-yt-tauri-mini]::before,#yt-tauri-popout{width:38px;height:38px;display:flex;align-items:center;justify-content:center;color:#fff;font:25px/1 Arial,sans-serif;cursor:pointer;flex:0 0 38px;background:transparent;border:0} .player-controls-bottom-right[data-yt-tauri-mini]::before{content:"◲"}'; document.head.append(style); } right.addEventListener('click', event => { const rect = right.getBoundingClientRect(); if (event.clientX > rect.left + 42) return; event.preventDefault(); event.stopImmediatePropagation(); parent.postMessage({ source: 'youtube-tauri', action: 'mini', time: document.querySelector('video')?.currentTime || 0 }, '*'); }, true); };
   document.addEventListener('mousedown', event => { if (event.button !== 0 || event.clientY > 170 || event.target.closest('button,a,input,[role="button"],.ytwPlayerTopControlsPlayerControlsTopRight,.player-controls-top-right')) return; parent.postMessage({ source: 'youtube-tauri', action: 'drag' }, '*'); }, true);
   let refreshQueued = false; new MutationObserver(() => { if (refreshQueued) return; refreshQueued = true; requestAnimationFrame(() => { refreshQueued = false; hide(); sendShortInfo(); addBack(); addMobileBack(); addBlock(); addMini(); }); }).observe(document, { childList: true, subtree: true }); hide(); sendShortInfo(); addBack(); addMobileBack(); addBlock(); addMini(); addEventListener('message', event => { if (event.data?.source === 'tauritube' && event.data?.action === 'mini-state') document.documentElement.classList.toggle('yt-tauri-mini', Boolean(event.data.mini)); });
   let locked = false, cover, controlsSuppressed = false, controlsHideTimer; const setControlsHidden = () => document.documentElement.classList.toggle('yt-tauri-controls-hidden', locked || controlsSuppressed); const installControlsStyle = () => { if (document.getElementById('yt-tauri-controls-style')) return; const parent = document.head || document.documentElement; if (!parent) return; const style = document.createElement('style'); style.id = 'yt-tauri-controls-style'; style.textContent = '#player-control-overlay,#player-controls .ytPlayerProgressBarHost{transition:opacity .15s ease!important}html.yt-tauri-controls-hidden #player-control-overlay,html.yt-tauri-controls-hidden #player-controls .ytPlayerProgressBarHost,html.yt-tauri-mini #yt-tauri-mobile-back{opacity:0!important;visibility:hidden!important;pointer-events:none!important}'; parent.append(style); }; installControlsStyle(); document.addEventListener('DOMContentLoaded', installControlsStyle, { once: true }); const scheduleControlsHide = () => { if (locked || controlsSuppressed) return; clearTimeout(controlsHideTimer); controlsHideTimer = setTimeout(() => { document.documentElement.classList.add('yt-tauri-controls-hidden'); document.querySelector('#player-controls-a11y-toggle')?.click(); }, 300); }; document.addEventListener('pointermove', event => { if (locked || controlsSuppressed) return; document.documentElement.classList.remove('yt-tauri-controls-hidden'); if (event.target.closest('#player-controls,player-top-controls,player-middle-controls,player-bottom-controls,yt-progress-bar')) { clearTimeout(controlsHideTimer); return; } scheduleControlsHide(); }, true);
@@ -396,7 +423,25 @@ const PLAYER_GUARD: &str = r#"(function () {
   const toggleControls = () => { controlsSuppressed = !controlsSuppressed; clearTimeout(controlsHideTimer); setControlsHidden(); toast(controlsSuppressed ? 'Player controls hidden — Shift+Z restores them' : 'Player controls restored'); };
   const toggleInput = () => { locked = !locked; clearTimeout(controlsHideTimer); setControlsHidden(); parent.postMessage({ source: 'youtube-tauri', action: 'input-lock', locked }, '*'); if (locked) { cover = document.createElement('div'); cover.id = 'yt-tauri-input-cover'; cover.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:transparent;pointer-events:auto;touch-action:none;cursor:none'; document.body.append(cover); events.forEach(type => document.addEventListener(type, block, true)); } else { cover && cover.remove(); events.forEach(type => document.removeEventListener(type, block, true)); } toast(locked ? 'Input disabled — Shift+X restores it' : 'Input restored'); };
   const shortcutsDown = new Set(); const shortcut = event => { const key = event.code === 'KeyX' || event.keyCode === 88 ? 'x' : event.code === 'KeyZ' || event.keyCode === 90 ? 'z' : ''; if (!key || !event.shiftKey || event.ctrlKey || event.altKey || event.metaKey) return; const run = key === 'x' ? toggleInput : toggleControls; if (event.type === 'keydown') { if (shortcutsDown.has(key)) return; shortcutsDown.add(key); run(); } else if (!shortcutsDown.has(key)) run(); else shortcutsDown.delete(key); event.preventDefault(); event.stopImmediatePropagation(); }; addEventListener('keydown', shortcut, true); addEventListener('keyup', shortcut, true);
+  const overlayStyle = document.createElement('style'); overlayStyle.textContent = '.ytmVideoInfoOverlay.ytmVideoInfoExpanded{display:none!important}'; (document.head || document.documentElement).append(overlayStyle);
+  document.addEventListener('click', event => { const target = event.target instanceof Element ? event.target.closest('.ytmVideoInfoChannelTitle,.ytmVideoInfoFlyoutChannelTitle,.ytmVideoInfoChannelAvatar') : null; if (!target) return; const link = target.closest('a.ytmVideoInfoChannelTitle') || document.querySelector('a.ytmVideoInfoChannelTitle'); const href = link?.getAttribute('href') || ''; const channelId = href.match(/\/channel\/([^/?]+)/)?.[1] || ''; const channel = link?.textContent?.trim() || document.querySelector('.ytmVideoInfoFlyoutChannelTitle')?.textContent?.trim() || ''; if (!channel && !channelId) return; event.preventDefault(); event.stopImmediatePropagation(); parent.postMessage({ source: 'youtube-tauri', action: 'open-channel', channel, channelId }, '*'); }, true);
 })();"#;
+
+#[tauri::command]
+async fn check_for_update(app: tauri::AppHandle) -> Result<Option<String>, String> {
+  use tauri_plugin_updater::UpdaterExt;
+  let updater = app.updater().map_err(|error| error.to_string())?;
+  updater.check().await.map(|update| update.map(|item| item.version)).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn do_update(app: tauri::AppHandle) -> Result<(), String> {
+  use tauri_plugin_updater::UpdaterExt;
+  let updater = app.updater().map_err(|error| error.to_string())?;
+  let update = updater.check().await.map_err(|error| error.to_string())?.ok_or_else(|| "no_update_available".to_string())?;
+  update.download_and_install(|_, _| {}, || {}).await.map_err(|error| error.to_string())?;
+  app.restart();
+}
 
 pub fn run() {
   install_input_lock_hook().expect("Could not install the Windows-key input lock");
@@ -426,6 +471,15 @@ pub fn run() {
     app.manage(TrayHandle(tray));
     let close_window = window.clone();
     window.on_window_event(move |event| { if let tauri::WindowEvent::CloseRequested { api, .. } = event { api.prevent_close(); close_window.hide().ok(); } });
+    window.show()?;
+    window.set_focus()?;
+    let handle = app.handle().clone();
+    tauri::async_runtime::spawn(async move {
+      use tauri_plugin_updater::UpdaterExt;
+      if let Ok(updater) = handle.updater() {
+        if let Ok(Some(update)) = updater.check().await { let _ = handle.emit("update-available", update.version); }
+      }
+    });
     Ok(())
-  }).manage(SearchState(Arc::new(Mutex::new(HashMap::new())))).invoke_handler(tauri::generate_handler![search_youtube, search_youtube_more, load_home, load_shorts, load_channel_videos, list_subscriptions, subscribe_channel, unsubscribe_channel, list_blocks, block_video, block_channel, unblock_item, minimize_window, hide_window, toggle_maximize, drag_window, set_input_lock]).run(tauri::generate_context!()).expect("error while running Tauritube");
+  }).manage(SearchState(Arc::new(Mutex::new(HashMap::new())))).plugin(tauri_plugin_updater::Builder::new().build()).invoke_handler(tauri::generate_handler![search_youtube, search_youtube_more, load_home, load_shorts, load_shorts_more, load_channel_videos, load_subscription_avatar, list_subscriptions, subscribe_channel, unsubscribe_channel, list_blocks, block_video, block_channel, unblock_item, minimize_window, hide_window, toggle_maximize, drag_window, set_input_lock, check_for_update, do_update]).run(tauri::generate_context!()).expect("error while running Tauritube");
 }

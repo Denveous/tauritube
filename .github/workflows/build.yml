@@ -62,6 +62,9 @@ jobs:
 
       - name: Build
         run: npm run build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       - name: Collect release files
         shell: pwsh
@@ -77,11 +80,14 @@ jobs:
             "src-tauri/target/release/bundle/deb/*.deb",
             "src-tauri/target/release/bundle/rpm/*.rpm",
             "src-tauri/target/release/bundle/appimage/*.AppImage",
-            "src-tauri/target/release/bundle/dmg/*.dmg"
+            "src-tauri/target/release/bundle/dmg/*.dmg",
+            "src-tauri/target/release/bundle/**/latest.json",
+            "src-tauri/target/release/bundle/**/*.sig"
           )
           foreach ($pattern in $patterns) {
             Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | ForEach-Object {
-              Copy-Item -LiteralPath $_.FullName -Destination "$out/$($_.Name)" -Force
+              $name = if ($_.Name -eq 'latest.json') { "$env:ARTIFACT-latest.json" } else { $_.Name }
+              Copy-Item -LiteralPath $_.FullName -Destination "$out/$name" -Force
             }
           }
           Get-ChildItem -Path "src-tauri/target/release/bundle/macos/*.app" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
@@ -112,6 +118,19 @@ jobs:
         with:
           path: release-artifacts
           merge-multiple: true
+
+      - name: Combine updater manifests
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path release-artifacts -Filter '*-latest.json'
+          if (!$files) { throw 'No updater manifests were produced' }
+          $manifest = $null
+          foreach ($file in $files) {
+            $current = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
+            if ($null -eq $manifest) { $manifest = $current; continue }
+            $current.platforms.PSObject.Properties | ForEach-Object { $manifest.platforms | Add-Member -NotePropertyName $_.Name -NotePropertyValue $_.Value -Force }
+          }
+          $manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath release-artifacts/latest.json -Encoding utf8
 
       - name: Move latest tag
         run: |
