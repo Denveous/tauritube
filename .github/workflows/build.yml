@@ -81,13 +81,13 @@ jobs:
             "src-tauri/target/release/bundle/rpm/*.rpm",
             "src-tauri/target/release/bundle/appimage/*.AppImage",
             "src-tauri/target/release/bundle/dmg/*.dmg",
-            "src-tauri/target/release/bundle/latest.json",
-            "src-tauri/target/release/bundle/**/latest.json",
+            "src-tauri/target/release/bundle/macos/*.tar.gz",
             "src-tauri/target/release/bundle/**/*.sig"
           )
           foreach ($pattern in $patterns) {
             Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | ForEach-Object {
-              $name = if ($_.Name -eq 'latest.json') { "$env:ARTIFACT-latest.json" } else { $_.Name }
+              $macosArch = $env:ARTIFACT -replace '^tauritube-macos-', ''
+              $name = if ($_.Name -eq 'Tauritube.app.tar.gz') { "Tauritube_0.1.0_$macosArch.app.tar.gz" } elseif ($_.Name -eq 'Tauritube.app.tar.gz.sig') { "Tauritube_0.1.0_$macosArch.app.tar.gz.sig" } else { $_.Name }
               Copy-Item -LiteralPath $_.FullName -Destination "$out/$name" -Force
             }
           }
@@ -123,14 +123,23 @@ jobs:
       - name: Combine updater manifests
         shell: pwsh
         run: |
-          $files = Get-ChildItem -Path release-artifacts -Filter '*-latest.json'
-          if (!$files) { throw 'No updater manifests were produced' }
-          $manifest = $null
-          foreach ($file in $files) {
-            $current = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
-            if ($null -eq $manifest) { $manifest = $current; continue }
-            $current.platforms.PSObject.Properties | ForEach-Object { $manifest.platforms | Add-Member -NotePropertyName $_.Name -NotePropertyValue $_.Value -Force }
+          $version = (Get-Content -LiteralPath src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $baseUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/latest/download"
+          $files = [ordered]@{
+            'windows-x86_64' = 'Tauritube_0.1.0_x64-setup.exe'
+            'linux-x86_64' = 'Tauritube_0.1.0_amd64.AppImage'
+            'linux-aarch64' = 'Tauritube_0.1.0_aarch64.AppImage'
+            'darwin-x86_64' = 'Tauritube_0.1.0_x64.app.tar.gz'
+            'darwin-aarch64' = 'Tauritube_0.1.0_arm64.app.tar.gz'
           }
+          $platforms = [ordered]@{}
+          foreach ($entry in $files.GetEnumerator()) {
+            $path = Join-Path release-artifacts $entry.Value
+            $signaturePath = "$path.sig"
+            if (!(Test-Path -LiteralPath $path) -or !(Test-Path -LiteralPath $signaturePath)) { throw "Missing updater artifact for $($entry.Key): $($entry.Value)" }
+            $platforms[$entry.Key] = [ordered]@{ url = "$baseUrl/$($entry.Value)"; signature = (Get-Content -LiteralPath $signaturePath -Raw).Trim() }
+          }
+          $manifest = [ordered]@{ version = $version; notes = 'Automated build'; pub_date = (Get-Date).ToUniversalTime().ToString('o'); platforms = $platforms }
           $manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath release-artifacts/latest.json -Encoding utf8
 
       - name: Move latest tag
